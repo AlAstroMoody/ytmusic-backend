@@ -6,12 +6,15 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
 from ytmusicapi import YTMusic, OAuthCredentials
+from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
 import yt_dlp
+
+from search_pagination import SearchPaginationError, search_songs_continue, search_songs_first_page
 
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, expose_headers=['X-Search-Continuation'])
 
 AUTH_FILE = os.getenv('AUTH_FILE') or os.getenv('OAUTH_FILE', 'browser.json')
 
@@ -52,15 +55,53 @@ def health():
 
 @app.route('/search')
 def search():
-    query = request.args.get('q')
+    query = request.args.get('q', '').strip()
     if not query:
         return jsonify({'error': 'Missing query parameter'}), 400
+
+    paginated = request.args.get('paginated', '').lower() in ('1', 'true', 'yes')
+
     try:
-        results = yt_public.search(query)
-        songs = [item for item in results if item.get('resultType') == 'song']
-        return jsonify(songs)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        songs, continuation = search_songs_first_page(yt_public, query)
+    except SearchPaginationError as exc:
+        return jsonify({'error': str(exc)}), exc.status_code
+    except (YTMusicServerError, YTMusicUserError, requests.RequestException) as exc:
+        return jsonify({'error': str(exc)}), 502
+
+    if paginated:
+        return jsonify({
+            'tracks': songs,
+            'continuation': continuation,
+        })
+
+    response = jsonify(songs)
+    if continuation:
+        response.headers['X-Search-Continuation'] = continuation
+    return response
+
+
+@app.route('/search/continue', methods=['GET', 'POST'])
+def search_continue():
+    if request.method == 'POST':
+        payload = request.get_json(silent=True) or {}
+        continuation = str(payload.get('continuation', '')).strip()
+    else:
+        continuation = request.args.get('continuation', '').strip()
+
+    if not continuation:
+        return jsonify({'error': 'Missing continuation parameter'}), 400
+
+    try:
+        songs, next_continuation = search_songs_continue(yt_public, continuation)
+    except SearchPaginationError as exc:
+        return jsonify({'error': str(exc)}), exc.status_code
+    except (YTMusicServerError, YTMusicUserError, requests.RequestException) as exc:
+        return jsonify({'error': str(exc)}), 502
+
+    return jsonify({
+        'tracks': songs,
+        'continuation': next_continuation,
+    })
 
 
 def require_auth():
