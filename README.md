@@ -19,6 +19,18 @@ pip install -r requirements.txt
 python app.py
 ```
 
+## Требования на сервере
+
+`deploy-safe.sh` сам поставит `python3-venv` через apt, если venv не создаётся.  
+Нужны: `git`, `sudo`, доступ к `apt`.
+
+При первом деплое вручную:
+
+```bash
+sudo apt update
+sudo apt install -y git python3
+```
+
 ## Auth-файлы: что копировать на сервер
 
 Да, auth-файл на сервере нужен, если используете эндпоинты с авторизацией.
