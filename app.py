@@ -10,6 +10,7 @@ from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
 import yt_dlp
 
 from search_pagination import SearchPaginationError, search_songs_continue, search_songs_first_page
+from track_normalize import normalize_tracks
 
 load_dotenv()
 
@@ -101,6 +102,55 @@ def search_continue():
     return jsonify({
         'tracks': songs,
         'continuation': next_continuation,
+    })
+
+
+@app.route('/suggest')
+def suggest():
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify({'error': 'Missing query parameter'}), 400
+
+    try:
+        suggestions = yt_public.get_search_suggestions(query)
+    except YTMusicUserError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except (YTMusicServerError, requests.RequestException) as exc:
+        return jsonify({'error': str(exc)}), 502
+
+    return jsonify({'suggestions': suggestions})
+
+
+@app.route('/radio')
+def radio():
+    video_id = request.args.get('videoId', '').strip()
+    if not video_id:
+        return jsonify({'error': 'Missing videoId parameter'}), 400
+
+    limit_raw = request.args.get('limit', '25')
+    try:
+        limit = max(1, min(int(limit_raw), 50))
+    except ValueError:
+        return jsonify({'error': 'Invalid limit parameter'}), 400
+
+    radio_mode = request.args.get('radio', '1').lower() not in ('0', 'false', 'no')
+
+    try:
+        playlist = yt_public.get_watch_playlist(
+            videoId=video_id,
+            limit=limit,
+            radio=radio_mode,
+        )
+    except YTMusicUserError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except (YTMusicServerError, requests.RequestException) as exc:
+        return jsonify({'error': str(exc)}), 502
+
+    tracks = normalize_tracks(playlist.get('tracks') or [])
+    return jsonify({
+        'tracks': tracks,
+        'playlistId': playlist.get('playlistId'),
+        'videoId': video_id,
     })
 
 
