@@ -24,25 +24,32 @@ def load_auth_client() -> YTMusic | None:
     if not os.path.exists(AUTH_FILE):
         return None
 
-    with open(AUTH_FILE, encoding='utf-8') as f:
-        auth_data = json.load(f)
+    try:
+        with open(AUTH_FILE, encoding='utf-8') as f:
+            auth_data = json.load(f)
 
-    if 'access_token' in auth_data:
-        client_id = os.getenv('YTM_CLIENT_ID')
-        client_secret = os.getenv('YTM_CLIENT_SECRET')
-        if not client_id or not client_secret:
-            raise RuntimeError(
-                'OAuth file detected. Set YTM_CLIENT_ID and YTM_CLIENT_SECRET in .env'
+        if 'access_token' in auth_data:
+            client_id = os.getenv('YTM_CLIENT_ID')
+            client_secret = os.getenv('YTM_CLIENT_SECRET')
+            if not client_id or not client_secret:
+                print(
+                    'WARNING: OAuth file detected but YTM_CLIENT_ID/YTM_CLIENT_SECRET '
+                    'missing; auth endpoints disabled'
+                )
+                return None
+            return YTMusic(
+                AUTH_FILE,
+                oauth_credentials=OAuthCredentials(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                ),
             )
-        return YTMusic(
-            AUTH_FILE,
-            oauth_credentials=OAuthCredentials(
-                client_id=client_id,
-                client_secret=client_secret,
-            ),
-        )
 
-    return YTMusic(AUTH_FILE)
+        return YTMusic(AUTH_FILE)
+    except Exception as exc:
+        print(f'WARNING: failed to load auth from {AUTH_FILE}: {exc}')
+        print('Auth endpoints (/liked, /playlists) disabled; public search/stream still work')
+        return None
 
 
 yt_public = YTMusic()
