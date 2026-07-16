@@ -7,9 +7,9 @@ from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
 from ytmusicapi import YTMusic, OAuthCredentials
 from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
-import yt_dlp
 
 from search_pagination import SearchPaginationError, search_songs_continue, search_songs_first_page
+from stream_service import StreamResolveError, open_audio_upstream, resolve_audio_url
 from track_normalize import normalize_tracks
 
 load_dotenv()
@@ -195,52 +195,84 @@ def get_playlists():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+def _normalize_playlist_id(playlist_id: str) -> str:
+    pid = playlist_id.strip()
+    if pid.startswith('VL'):
+        return pid[2:]
+    return pid
+
+
+@app.route('/playlist')
+@app.route('/playlist/<playlist_id>')
+def get_playlist(playlist_id: str | None = None):
+    raw_id = (playlist_id or request.args.get('id', '')).strip()
+    if not raw_id:
+        return jsonify({'error': 'Missing playlist id'}), 400
+
+    limit_raw = request.args.get('limit', '100')
+    try:
+        limit = max(1, min(int(limit_raw), 200))
+    except ValueError:
+        return jsonify({'error': 'Invalid limit parameter'}), 400
+
+    pid = _normalize_playlist_id(raw_id)
+
+    try:
+        # Public / catalog playlists — no auth required.
+        playlist = yt_public.get_playlist(pid, limit=limit)
+    except YTMusicUserError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except (YTMusicServerError, requests.RequestException) as exc:
+        return jsonify({'error': str(exc)}), 502
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 502
+
+    tracks = normalize_tracks(playlist.get('tracks') or [])
+    return jsonify({
+        'id': playlist.get('id') or pid,
+        'title': playlist.get('title'),
+        'author': playlist.get('author'),
+        'thumbnails': playlist.get('thumbnails') or [],
+        'trackCount': playlist.get('trackCount'),
+        'duration': playlist.get('duration'),
+        'duration_seconds': playlist.get('duration_seconds'),
+        'tracks': tracks,
+    })
+
+
 @app.route('/get-audio')
 def get_audio():
-    video_id = request.args.get('videoId')
+    """Deprecated: use GET /stream?videoId= as <audio src>. Kept for debug."""
+    video_id = request.args.get('videoId', '').strip()
     if not video_id:
         return jsonify({'error': 'Missing videoId parameter'}), 400
     try:
         audio_url = resolve_audio_url(video_id)
-        return jsonify({'audioUrl': audio_url})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-def resolve_audio_url(video_id: str) -> str:
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'no_warnings': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
-        for f in info.get('formats', []):
-            if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                url = f.get('url')
-                if url:
-                    return url
-        url = info.get('url')
-        if not url:
-            raise Exception('No audio stream found')
-        return url
+        response = jsonify({'audioUrl': audio_url, 'deprecated': True})
+        response.headers['Deprecation'] = 'true'
+        return response
+    except StreamResolveError as exc:
+        return jsonify({'error': exc.message, 'code': exc.code}), exc.status_code
 
 
 @app.route('/stream')
 def stream():
-    video_id = request.args.get('videoId')
+    """Media endpoint for <audio src>. Do not change this contract."""
+    video_id = request.args.get('videoId', '').strip()
     if not video_id:
-        return jsonify({'error': 'Missing videoId parameter'}), 400
+        return jsonify({'error': 'Missing videoId parameter', 'code': 'bad_request'}), 400
+
     try:
-        audio_url = resolve_audio_url(video_id)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        upstream, _url = open_audio_upstream(
+            video_id,
+            range_header=request.headers.get('Range'),
+        )
+    except StreamResolveError as exc:
+        return jsonify({'error': exc.message, 'code': exc.code}), exc.status_code
+    except requests.RequestException as exc:
+        return jsonify({'error': str(exc), 'code': 'upstream'}), 502
 
-    headers = {}
-    if range_header := request.headers.get('Range'):
-        headers['Range'] = range_header
-
-    upstream = requests.get(audio_url, headers=headers, stream=True, timeout=30)
     response_headers = {
         key: value
         for key, value in upstream.headers.items()

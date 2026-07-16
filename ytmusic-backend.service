@@ -7,7 +7,8 @@ Type=simple
 User=root
 WorkingDirectory=/opt/ytmusic-backend
 EnvironmentFile=/opt/ytmusic-backend/.env
-ExecStart=/opt/ytmusic-backend/venv/bin/gunicorn -w 2 -k gthread -b 127.0.0.1:5000 app:app
+# One worker so in-memory stream URL cache is shared; threads for concurrent streams.
+ExecStart=/opt/ytmusic-backend/venv/bin/gunicorn -w 1 -k gthread --threads 8 -b 127.0.0.1:5000 app:app
 Restart=always
 RestartSec=3
 TimeoutStopSec=20
