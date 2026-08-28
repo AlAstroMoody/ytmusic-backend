@@ -136,7 +136,13 @@ curl -s "http://127.0.0.1:5000/playlist?id=PL3A_1s_Z8MQbYIvki-pbcerX8zrF4U8zQ&li
 - Flask отдаёт файл с поддержкой `Range` (`send_file(conditional=True)`)
 - повторный запрос того же `videoId` — из кэша, без повторного download
 
-На сервере для YouTube рекомендуется **Deno** (требование yt-dlp 2025+): `curl -fsSL https://deno.land/install.sh | sh`
+На сервере yt-dlp для YouTube требует **JS runtime** (Deno/Node) — это не про CLI, а про сам пакет `yt_dlp`. Ставится через pip вместе с зависимостями:
+
+```bash
+pip install -r requirements.txt   # включает deno и yt-dlp-ejs
+```
+
+Альтернатива Deno: Node 20+ (`apt install nodejs`) — подхватится автоматически, если Deno нет.
 
 Ошибки — JSON: `{ "error": "...", "code": "unavailable|geo|upstream|truncated" }`.
 

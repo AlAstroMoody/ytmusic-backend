@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,29 @@ def _classify_ytdlp_error(exc: Exception) -> StreamResolveError:
     return StreamResolveError('upstream', str(exc), 502)
 
 
+def _js_runtime_opts() -> dict[str, Any]:
+    """yt-dlp needs an external JS runtime for full YouTube support (same for pip and CLI)."""
+    runtimes: dict[str, dict[str, str]] = {}
+
+    try:
+        import deno
+
+        runtimes['deno'] = {'path': deno.find_deno_bin()}
+    except Exception:
+        deno_path = shutil.which('deno')
+        if deno_path:
+            runtimes['deno'] = {'path': deno_path}
+
+    if not runtimes:
+        node_path = shutil.which('node')
+        if node_path:
+            runtimes['node'] = {'path': node_path}
+
+    if not runtimes:
+        return {}
+    return {'js_runtimes': runtimes}
+
+
 def _ydl_opts(*, outtmpl: str | None = None) -> dict[str, Any]:
     opts: dict[str, Any] = {
         'format': 'bestaudio/best',
@@ -45,6 +69,7 @@ def _ydl_opts(*, outtmpl: str | None = None) -> dict[str, Any]:
         'extractor_args': {
             'youtube': {'player_client': ['default', '-android_sdkless']},
         },
+        **_js_runtime_opts(),
     }
     if outtmpl is not None:
         opts['outtmpl'] = outtmpl

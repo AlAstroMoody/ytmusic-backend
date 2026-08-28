@@ -84,10 +84,6 @@ source venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
-if ! command -v deno >/dev/null 2>&1; then
-  echo "WARN: deno not in PATH — yt-dlp may fail on YouTube downloads (install: curl -fsSL https://deno.land/install.sh | sh)"
-fi
-
 echo "==> Restart service"
 sudo systemctl daemon-reload
 sudo systemctl restart "${SERVICE_NAME}"
