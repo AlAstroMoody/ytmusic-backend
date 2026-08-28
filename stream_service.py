@@ -88,13 +88,22 @@ def _extract_stream_target(video_id: str) -> dict[str, str]:
     return {'url': picked['url'], 'headers': headers}
 
 
+def _normalize_upstream_range(range_header: str | None) -> str:
+    """googlevideo rejects open-ended and missing Range on current DASH/fmp4 URLs."""
+    if not range_header:
+        return 'bytes=0-65535'
+    value = range_header.strip()
+    if value.lower() in ('bytes=0-', 'bytes=0'):
+        return 'bytes=0-65535'
+    return value
+
+
 def _upstream_headers(
     stream_headers: dict[str, str],
     range_header: str | None,
 ) -> dict[str, str]:
     headers = dict(stream_headers)
-    if range_header:
-        headers['Range'] = range_header
+    headers['Range'] = _normalize_upstream_range(range_header)
     return headers
 
 
