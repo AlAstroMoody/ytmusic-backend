@@ -14,6 +14,14 @@ STREAM_URL_CACHE_TTL = float(os.getenv('STREAM_URL_CACHE_TTL', '600'))
 
 # googlevideo rejects open-ended Range (bytes=N-); cap each upstream request to 1 MiB.
 _UPSTREAM_RANGE_CHUNK = 1024 * 1024
+
+# Some player clients return DASH init URLs that only serve ~1 MiB (playback stops after ~1s).
+_PLAYER_CLIENT_STRATEGIES = (
+    ['web', '-android_sdkless'],
+    ['web_safari', '-android_sdkless'],
+    ['default', '-android_sdkless'],
+)
+
 _url_cache: TtlLruCache[str, dict[str, str]] = TtlLruCache(STREAM_URL_CACHE_MAX, STREAM_URL_CACHE_TTL)
 
 
@@ -36,36 +44,34 @@ def _classify_ytdlp_error(exc: Exception) -> StreamResolveError:
     return StreamResolveError('upstream', str(exc), 502)
 
 
-def _ydl_opts() -> dict[str, Any]:
-    return {
-        'format': '140/bestaudio[ext=m4a]/bestaudio/best',
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': {
-            'youtube': {'player_client': ['default', '-android_sdkless']},
-        },
-    }
+def _is_progressive_audio(fmt: dict[str, Any]) -> bool:
+    if not fmt.get('url'):
+        return False
+    if fmt.get('fragments'):
+        return False
+    protocol = fmt.get('protocol') or 'https'
+    if protocol not in ('https', 'http'):
+        return False
+    if fmt.get('acodec') in (None, 'none'):
+        return False
+    if fmt.get('vcodec') not in (None, 'none'):
+        return False
+    container = (fmt.get('container') or fmt.get('ext') or '').lower()
+    return 'dash' not in container
 
 
 def _pick_audio_format(info: dict[str, Any]) -> dict[str, Any] | None:
     formats = info.get('formats') or []
-    audio_only = [
-        f for f in formats
-        if f.get('url') and f.get('acodec') not in (None, 'none') and f.get('vcodec') in (None, 'none')
-    ]
+    audio_only = [f for f in formats if _is_progressive_audio(f)]
     if not audio_only:
-        url = info.get('url')
-        if not url:
-            return None
-        return {'url': url, 'http_headers': info.get('http_headers') or {}}
+        return None
 
     def score(fmt: dict[str, Any]) -> tuple:
         itag = str(fmt.get('format_id') or '')
         ext = (fmt.get('ext') or '').lower()
         abr = fmt.get('abr') or 0
-        prefer = 2 if itag == '140' or ext == 'm4a' else (1 if ext in ('webm', 'opus') else 0)
-        dash_penalty = 1 if fmt.get('fragments') or 'dash' in (fmt.get('format') or '').lower() else 0
-        return (prefer, -dash_penalty, abr)
+        prefer = 2 if itag == '140' else (1 if ext == 'm4a' else 0)
+        return (prefer, abr)
 
     audio_only.sort(key=score, reverse=True)
     fmt = audio_only[0]
@@ -75,19 +81,62 @@ def _pick_audio_format(info: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _extract_stream_target(video_id: str) -> dict[str, str]:
-    try:
-        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-            info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
-    except Exception as exc:
-        raise _classify_ytdlp_error(exc) from exc
+def _extract_info(video_id: str, player_clients: list[str]) -> dict[str, Any]:
+    opts: dict[str, Any] = {
+        'format': '140/bestaudio[ext=m4a][protocol=https]/bestaudio[protocol=https]/best',
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {'youtube': {'player_client': player_clients}},
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
 
+
+def _stream_target_from_info(info: dict[str, Any]) -> dict[str, str] | None:
     picked = _pick_audio_format(info or {})
     if not picked or not picked.get('url'):
-        raise StreamResolveError('unavailable', 'No audio stream found', 404)
-
+        return None
     headers = {str(k): str(v) for k, v in (picked.get('http_headers') or {}).items()}
     return {'url': picked['url'], 'headers': headers}
+
+
+def _probe_range(url: str, headers: dict[str, str], range_header: str) -> bool:
+    probe_headers = dict(headers)
+    probe_headers['Range'] = range_header
+    try:
+        upstream = requests.get(url, headers=probe_headers, stream=True, timeout=8)
+    except requests.RequestException:
+        return False
+    ok = upstream.status_code == 206
+    upstream.close()
+    return ok
+
+
+def _url_is_fully_proxyable(url: str, headers: dict[str, str]) -> bool:
+    # Reject DASH init URLs that only serve the first megabyte.
+    if not _probe_range(url, headers, 'bytes=0-1023'):
+        return False
+    return _probe_range(url, headers, 'bytes=1048576-1048576')
+
+
+def _extract_stream_target(video_id: str) -> dict[str, str]:
+    last_error: Exception | None = None
+    for player_clients in _PLAYER_CLIENT_STRATEGIES:
+        try:
+            info = _extract_info(video_id, player_clients)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+        target = _stream_target_from_info(info)
+        if not target:
+            continue
+        if _url_is_fully_proxyable(target['url'], target['headers']):
+            return target
+
+    if last_error is not None:
+        raise _classify_ytdlp_error(last_error) from last_error
+    raise StreamResolveError('unavailable', 'No proxyable audio stream found', 404)
 
 
 def _normalize_upstream_range(range_header: str | None) -> str:
@@ -122,8 +171,10 @@ def _upstream_headers(
 def resolve_stream_target(video_id: str, *, bypass_cache: bool = False) -> dict[str, str]:
     if not bypass_cache:
         cached = _url_cache.get(video_id)
-        if cached:
+        if cached and _url_is_fully_proxyable(cached['url'], cached['headers']):
             return cached
+        if cached:
+            _url_cache.invalidate(video_id)
 
     target = _extract_stream_target(video_id)
     _url_cache.set(video_id, target)
