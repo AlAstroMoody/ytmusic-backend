@@ -12,7 +12,7 @@ Flask-бэкенд для поиска в YouTube Music и проксирова�
 - `GET /suggest?q=...` — подсказки поиска (`{ "suggestions": ["..."] }`)
 - `GET /radio?videoId=...` — очередь похожих треков (radio / watch playlist)
 - `GET /playlist?id=...` — публичный плейлист (треки в общем формате); также `GET /playlist/<id>`
-- `GET /stream?videoId=...` — **media URL для `<audio src>`** (proxy + Range; контракт не ломать)
+- `GET /stream?videoId=...` — **media URL для `<audio src>`** (yt-dlp download + Range; контракт не ломать)
 - `GET /liked` — лайкнутые треки (нужен auth-файл)
 - `GET /playlists` — плейлисты библиотеки (нужен auth-файл)
 - `GET /get-audio?videoId=...` — **deprecated**, только отладка; фронт использует `/stream`
@@ -132,14 +132,13 @@ curl -s "http://127.0.0.1:5000/playlist?id=PL3A_1s_Z8MQbYIvki-pbcerX8zrF4U8zQ&li
 Семантика: браузер ставит `src` на `/stream?videoId=...`. Это **не JSON**.
 
 Поведение бэка:
-- yt-dlp резолвит audio URL (предпочтение m4a / itag 140)
-- in-memory URL cache: TTL + max entries (см. `.env.example`)
-- при 403/410 на первом GET — invalidate + один retry с новым URL
-- `Range` прокидывается (seek)
+- yt-dlp скачивает `bestaudio` (DASH/HLS мёрджит сам) во временный кэш на диске
+- Flask отдаёт файл с поддержкой `Range` (`send_file(conditional=True)`)
+- повторный запрос того же `videoId` — из кэша, без повторного download
 
-Ошибки resolve (до стрима) — JSON: `{ "error": "...", "code": "expired|unavailable|geo|upstream" }`.
+На сервере для YouTube рекомендуется **Deno** (требование yt-dlp 2025+): `curl -fsSL https://deno.land/install.sh | sh`
 
-Рекомендуется gunicorn **1 worker** + threads (in-memory cache не шарится между workers). См. `ytmusic-backend.service`.
+Ошибки — JSON: `{ "error": "...", "code": "unavailable|geo|upstream|truncated" }`.
 
 ## Локальный запуск
 

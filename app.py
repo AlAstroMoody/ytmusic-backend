@@ -3,20 +3,13 @@ import os
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request, send_file, stream_with_context
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from ytmusicapi import YTMusic, OAuthCredentials
 from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
 
 from search_pagination import SearchPaginationError, search_songs_continue, search_songs_first_page
-from stream_service import (
-    StreamResolveError,
-    build_proxy_headers,
-    guess_audio_mimetype,
-    iter_upstream_body,
-    open_stream,
-    resolve_audio_url,
-)
+from stream_service import StreamResolveError, guess_audio_mimetype, resolve_audio_url, resolve_stream_file
 from track_normalize import normalize_tracks
 
 load_dotenv()
@@ -271,38 +264,19 @@ def stream():
         return jsonify({'error': 'Missing videoId parameter', 'code': 'bad_request'}), 400
 
     try:
-        mode, payload = open_stream(
-            video_id,
-            range_header=request.headers.get('Range'),
+        path = resolve_stream_file(video_id)
+        response = send_file(
+            path,
+            mimetype=guess_audio_mimetype(path),
+            conditional=True,
+            download_name=path.name,
         )
-        if mode == 'file':
-            response = send_file(
-                payload,
-                mimetype=guess_audio_mimetype(payload),
-                conditional=True,
-                download_name=payload.name,
-            )
-            response.headers['Cache-Control'] = 'no-store'
-            return response
-
-        upstream = payload
+        response.headers['Cache-Control'] = 'no-store'
+        return response
     except StreamResolveError as exc:
         response = jsonify({'error': exc.message, 'code': exc.code})
         response.headers['Cache-Control'] = 'no-store'
         return response, exc.status_code
-    except requests.RequestException as exc:
-        response = jsonify({'error': str(exc), 'code': 'upstream'})
-        response.headers['Cache-Control'] = 'no-store'
-        return response, 502
-
-    response_headers = build_proxy_headers(upstream.headers)
-    response_headers['Cache-Control'] = 'no-store'
-
-    return Response(
-        stream_with_context(iter_upstream_body(upstream)),
-        status=upstream.status_code,
-        headers=response_headers,
-    )
 
 if __name__ == '__main__':
     debug = os.getenv('FLASK_DEBUG', '0') == '1'
