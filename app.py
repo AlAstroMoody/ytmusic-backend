@@ -14,10 +14,8 @@ from stream_service import (
     build_proxy_headers,
     guess_audio_mimetype,
     iter_upstream_body,
-    open_audio_upstream,
+    open_stream,
     resolve_audio_url,
-    resolve_stream_file,
-    stream_delivery_mode,
 )
 from track_normalize import normalize_tracks
 
@@ -273,21 +271,21 @@ def stream():
         return jsonify({'error': 'Missing videoId parameter', 'code': 'bad_request'}), 400
 
     try:
-        if stream_delivery_mode(video_id) == 'file':
-            path = resolve_stream_file(video_id)
+        mode, payload = open_stream(
+            video_id,
+            range_header=request.headers.get('Range'),
+        )
+        if mode == 'file':
             response = send_file(
-                path,
-                mimetype=guess_audio_mimetype(path),
+                payload,
+                mimetype=guess_audio_mimetype(payload),
                 conditional=True,
-                download_name=path.name,
+                download_name=payload.name,
             )
             response.headers['Cache-Control'] = 'no-store'
             return response
 
-        upstream = open_audio_upstream(
-            video_id,
-            range_header=request.headers.get('Range'),
-        )
+        upstream = payload
     except StreamResolveError as exc:
         response = jsonify({'error': exc.message, 'code': exc.code})
         response.headers['Cache-Control'] = 'no-store'
