@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import requests
@@ -11,7 +12,8 @@ from ttl_cache import TtlLruCache
 STREAM_URL_CACHE_MAX = int(os.getenv('STREAM_URL_CACHE_MAX', '96'))
 STREAM_URL_CACHE_TTL = float(os.getenv('STREAM_URL_CACHE_TTL', '600'))
 
-# Cached stream target: direct googlevideo URL + headers yt-dlp expects for that format.
+# googlevideo rejects open-ended Range (bytes=N-); cap each upstream request to 1 MiB.
+_UPSTREAM_RANGE_CHUNK = 1024 * 1024
 _url_cache: TtlLruCache[str, dict[str, str]] = TtlLruCache(STREAM_URL_CACHE_MAX, STREAM_URL_CACHE_TTL)
 
 
@@ -89,12 +91,22 @@ def _extract_stream_target(video_id: str) -> dict[str, str]:
 
 
 def _normalize_upstream_range(range_header: str | None) -> str:
-    """googlevideo rejects open-ended and missing Range on current DASH/fmp4 URLs."""
+    """Map open-ended browser Range values to bounded chunks googlevideo accepts."""
     if not range_header:
-        return 'bytes=0-65535'
+        end = _UPSTREAM_RANGE_CHUNK - 1
+        return f'bytes=0-{end}'
+
     value = range_header.strip()
-    if value.lower() in ('bytes=0-', 'bytes=0'):
-        return 'bytes=0-65535'
+    if re.fullmatch(r'bytes=0-', value, re.I):
+        end = _UPSTREAM_RANGE_CHUNK - 1
+        return f'bytes=0-{end}'
+
+    open_ended = re.fullmatch(r'bytes=(\d+)-', value, re.I)
+    if open_ended:
+        start = int(open_ended.group(1))
+        end = start + _UPSTREAM_RANGE_CHUNK - 1
+        return f'bytes={start}-{end}'
+
     return value
 
 

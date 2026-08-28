@@ -269,15 +269,20 @@ def stream():
             range_header=request.headers.get('Range'),
         )
     except StreamResolveError as exc:
-        return jsonify({'error': exc.message, 'code': exc.code}), exc.status_code
+        response = jsonify({'error': exc.message, 'code': exc.code})
+        response.headers['Cache-Control'] = 'no-store'
+        return response, exc.status_code
     except requests.RequestException as exc:
-        return jsonify({'error': str(exc), 'code': 'upstream'}), 502
+        response = jsonify({'error': str(exc), 'code': 'upstream'})
+        response.headers['Cache-Control'] = 'no-store'
+        return response, 502
 
     response_headers = {
         key: value
         for key, value in upstream.headers.items()
         if key.lower() in ('content-type', 'content-length', 'content-range', 'accept-ranges')
     }
+    response_headers['Cache-Control'] = 'no-store'
 
     return Response(
         stream_with_context(upstream.iter_content(chunk_size=64 * 1024)),
