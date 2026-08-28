@@ -3,7 +3,7 @@ import os
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request, stream_with_context
+from flask import Flask, Response, jsonify, request, send_file, stream_with_context
 from flask_cors import CORS
 from ytmusicapi import YTMusic, OAuthCredentials
 from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
@@ -12,9 +12,12 @@ from search_pagination import SearchPaginationError, search_songs_continue, sear
 from stream_service import (
     StreamResolveError,
     build_proxy_headers,
+    guess_audio_mimetype,
     iter_upstream_body,
     open_audio_upstream,
     resolve_audio_url,
+    resolve_stream_file,
+    stream_delivery_mode,
 )
 from track_normalize import normalize_tracks
 
@@ -270,7 +273,18 @@ def stream():
         return jsonify({'error': 'Missing videoId parameter', 'code': 'bad_request'}), 400
 
     try:
-        upstream, _url, skip = open_audio_upstream(
+        if stream_delivery_mode(video_id) == 'file':
+            path = resolve_stream_file(video_id)
+            response = send_file(
+                path,
+                mimetype=guess_audio_mimetype(path),
+                conditional=True,
+                download_name=path.name,
+            )
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+
+        upstream = open_audio_upstream(
             video_id,
             range_header=request.headers.get('Range'),
         )
@@ -283,11 +297,11 @@ def stream():
         response.headers['Cache-Control'] = 'no-store'
         return response, 502
 
-    response_headers = build_proxy_headers(upstream.headers, skip)
+    response_headers = build_proxy_headers(upstream.headers)
     response_headers['Cache-Control'] = 'no-store'
 
     return Response(
-        stream_with_context(iter_upstream_body(upstream, skip)),
+        stream_with_context(iter_upstream_body(upstream)),
         status=upstream.status_code,
         headers=response_headers,
     )

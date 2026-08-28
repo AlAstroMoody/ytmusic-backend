@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Iterator
+import threading
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, Literal
 
 import requests
 import yt_dlp
@@ -11,13 +14,14 @@ from ttl_cache import TtlLruCache
 
 STREAM_URL_CACHE_MAX = int(os.getenv('STREAM_URL_CACHE_MAX', '96'))
 STREAM_URL_CACHE_TTL = float(os.getenv('STREAM_URL_CACHE_TTL', '600'))
+STREAM_FILE_CACHE_DIR = Path(os.getenv('STREAM_FILE_CACHE_DIR', '/tmp/ytmusic-stream-cache'))
+STREAM_FILE_CACHE_MAX = int(os.getenv('STREAM_FILE_CACHE_MAX', '48'))
+STREAM_FILE_MIN_BYTES = int(os.getenv('STREAM_FILE_MIN_BYTES', str(64 * 1024)))
 
 # googlevideo rejects open-ended Range (bytes=N-); cap each upstream request to 1 MiB.
 _UPSTREAM_RANGE_CHUNK = 1024 * 1024
 
-# DASH init URLs from some clients only serve the first megabyte; overlap past that limit.
-_DASH_SINGLE_URL_LIMIT = 1024 * 1024
-_OVERLAP = 128 * 1024
+_AUDIO_EXTENSIONS = ('m4a', 'webm', 'opus', 'mp4', 'ogg')
 
 _PLAYER_CLIENT_STRATEGIES = (
     ['default', '-android_sdkless'],
@@ -26,6 +30,8 @@ _PLAYER_CLIENT_STRATEGIES = (
 )
 
 _url_cache: TtlLruCache[str, dict[str, str]] = TtlLruCache(STREAM_URL_CACHE_MAX, STREAM_URL_CACHE_TTL)
+_download_locks: dict[str, threading.Lock] = {}
+_download_locks_guard = threading.Lock()
 
 
 class StreamResolveError(Exception):
@@ -45,6 +51,19 @@ def _classify_ytdlp_error(exc: Exception) -> StreamResolveError:
     if 'geo' in text or 'country' in text or 'not made this video available' in text:
         return StreamResolveError('geo', str(exc), 451)
     return StreamResolveError('upstream', str(exc), 502)
+
+
+def _ydl_opts(player_clients: list[str], *, outtmpl: str | None = None) -> dict[str, Any]:
+    opts: dict[str, Any] = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {'youtube': {'player_client': player_clients}},
+    }
+    if outtmpl is not None:
+        opts['outtmpl'] = outtmpl
+        opts['noplaylist'] = True
+    return opts
 
 
 def _pick_audio_format(info: dict[str, Any]) -> dict[str, str] | None:
@@ -77,13 +96,7 @@ def _pick_audio_format(info: dict[str, Any]) -> dict[str, str] | None:
 
 
 def _extract_info(video_id: str, player_clients: list[str]) -> dict[str, Any]:
-    opts: dict[str, Any] = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': {'youtube': {'player_client': player_clients}},
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(_ydl_opts(player_clients)) as ydl:
         return ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
 
 
@@ -102,7 +115,8 @@ def _probe_range(url: str, headers: dict[str, str], range_header: str) -> bool:
 def _url_is_fully_proxyable(url: str, headers: dict[str, str]) -> bool:
     if not _probe_range(url, headers, 'bytes=0-1023'):
         return False
-    return _probe_range(url, headers, 'bytes=1048576-1048576')
+    # Single byte at 1048576 can still 206 on DASH init URLs; require a real chunk past 1 MiB.
+    return _probe_range(url, headers, 'bytes=1048576-1114111')
 
 
 def _extract_stream_target(video_id: str) -> dict[str, str]:
@@ -132,52 +146,6 @@ def _extract_stream_target(video_id: str) -> dict[str, str]:
     raise StreamResolveError('unavailable', 'No audio stream found', 404)
 
 
-def _normalize_upstream_range(range_header: str | None) -> str:
-    """Map open-ended browser Range values to bounded chunks googlevideo accepts."""
-    if not range_header:
-        end = _UPSTREAM_RANGE_CHUNK - 1
-        return f'bytes=0-{end}'
-
-    value = range_header.strip()
-    if re.fullmatch(r'bytes=0-', value, re.I):
-        end = _UPSTREAM_RANGE_CHUNK - 1
-        return f'bytes=0-{end}'
-
-    open_ended = re.fullmatch(r'bytes=(\d+)-', value, re.I)
-    if open_ended:
-        start = int(open_ended.group(1))
-        end = start + _UPSTREAM_RANGE_CHUNK - 1
-        return f'bytes={start}-{end}'
-
-    return value
-
-
-def _plan_upstream_fetch(range_header: str | None) -> tuple[str, int]:
-    """Return upstream Range header and bytes to skip from the response body."""
-    normalized = _normalize_upstream_range(range_header)
-    matched = re.fullmatch(r'bytes=(\d+)-(\d+)', normalized, re.IGNORECASE)
-    if not matched:
-        return normalized, 0
-
-    start = int(matched.group(1))
-    end = int(matched.group(2))
-    if start >= _DASH_SINGLE_URL_LIMIT:
-        overlap_start = max(0, start - _OVERLAP)
-        skip = start - overlap_start
-        return f'bytes={overlap_start}-{end}', skip
-    return normalized, 0
-
-
-def _upstream_headers(
-    stream_headers: dict[str, str],
-    range_header: str | None,
-) -> tuple[dict[str, str], int]:
-    upstream_range, skip = _plan_upstream_fetch(range_header)
-    headers = dict(stream_headers)
-    headers['Range'] = upstream_range
-    return headers, skip
-
-
 def resolve_stream_target(video_id: str, *, bypass_cache: bool = False) -> dict[str, str]:
     if not bypass_cache:
         cached = _url_cache.get(video_id)
@@ -199,55 +167,151 @@ def invalidate_audio_url(video_id: str) -> None:
     _url_cache.invalidate(video_id)
 
 
-def build_proxy_headers(upstream_headers: requests.structures.CaseInsensitiveDict, skip: int) -> dict[str, str]:
+def stream_delivery_mode(video_id: str) -> Literal['direct', 'file']:
+    target = resolve_stream_target(video_id)
+    if _url_is_fully_proxyable(target['url'], target['headers']):
+        return 'direct'
+    return 'file'
+
+
+def _download_lock(video_id: str) -> threading.Lock:
+    with _download_locks_guard:
+        lock = _download_locks.get(video_id)
+        if lock is None:
+            lock = threading.Lock()
+            _download_locks[video_id] = lock
+        return lock
+
+
+def _find_cached_file(video_id: str) -> Path | None:
+    for ext in _AUDIO_EXTENSIONS:
+        path = STREAM_FILE_CACHE_DIR / f'{video_id}.{ext}'
+        if path.is_file() and path.stat().st_size >= STREAM_FILE_MIN_BYTES:
+            return path
+    return None
+
+
+def _cleanup_partial_downloads(video_id: str) -> None:
+    for ext in _AUDIO_EXTENSIONS:
+        path = STREAM_FILE_CACHE_DIR / f'{video_id}.{ext}'
+        if path.is_file() and path.stat().st_size < STREAM_FILE_MIN_BYTES:
+            path.unlink(missing_ok=True)
+    partial = STREAM_FILE_CACHE_DIR / f'{video_id}.part'
+    partial.unlink(missing_ok=True)
+
+
+def _enforce_file_cache_limits() -> None:
+    files = [
+        path
+        for path in STREAM_FILE_CACHE_DIR.iterdir()
+        if path.is_file() and path.suffix.lstrip('.') in _AUDIO_EXTENSIONS
+    ]
+    if len(files) <= STREAM_FILE_CACHE_MAX:
+        return
+    files.sort(key=lambda path: path.stat().st_mtime)
+    for path in files[: len(files) - STREAM_FILE_CACHE_MAX]:
+        path.unlink(missing_ok=True)
+
+
+def _download_stream_file(video_id: str, player_clients: list[str]) -> None:
+    STREAM_FILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    outtmpl = str(STREAM_FILE_CACHE_DIR / video_id) + '.%(ext)s'
+    with yt_dlp.YoutubeDL(_ydl_opts(player_clients, outtmpl=outtmpl)) as ydl:
+        ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
+
+
+def resolve_stream_file(video_id: str) -> Path:
+    cached = _find_cached_file(video_id)
+    if cached:
+        return cached
+
+    with _download_lock(video_id):
+        cached = _find_cached_file(video_id)
+        if cached:
+            return cached
+
+        last_error: Exception | None = None
+        for player_clients in _PLAYER_CLIENT_STRATEGIES:
+            _cleanup_partial_downloads(video_id)
+            try:
+                _download_stream_file(video_id, player_clients)
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            cached = _find_cached_file(video_id)
+            if cached:
+                _enforce_file_cache_limits()
+                return cached
+
+        _cleanup_partial_downloads(video_id)
+        if last_error is not None:
+            raise _classify_ytdlp_error(last_error) from last_error
+        raise StreamResolveError('unavailable', 'Download produced no audio file', 502)
+
+
+def guess_audio_mimetype(path: Path) -> str:
+    ext = path.suffix.lower().lstrip('.')
+    if ext in ('m4a', 'mp4'):
+        return 'audio/mp4'
+    if ext == 'webm':
+        return 'audio/webm'
+    if ext == 'opus':
+        return 'audio/opus'
+    if ext == 'ogg':
+        return 'audio/ogg'
+    return 'application/octet-stream'
+
+
+def _normalize_upstream_range(range_header: str | None) -> str:
+    if not range_header:
+        end = _UPSTREAM_RANGE_CHUNK - 1
+        return f'bytes=0-{end}'
+
+    value = range_header.strip()
+    if re.fullmatch(r'bytes=0-', value, re.IGNORECASE):
+        end = _UPSTREAM_RANGE_CHUNK - 1
+        return f'bytes=0-{end}'
+
+    open_ended = re.fullmatch(r'bytes=(\d+)-', value, re.IGNORECASE)
+    if open_ended:
+        start = int(open_ended.group(1))
+        end = start + _UPSTREAM_RANGE_CHUNK - 1
+        return f'bytes={start}-{end}'
+
+    return value
+
+
+def _upstream_headers(stream_headers: dict[str, str], range_header: str | None) -> dict[str, str]:
+    headers = dict(stream_headers)
+    headers['Range'] = _normalize_upstream_range(range_header)
+    return headers
+
+
+def build_proxy_headers(upstream_headers: requests.structures.CaseInsensitiveDict) -> dict[str, str]:
     allowed = ('content-type', 'content-length', 'content-range', 'accept-ranges')
-    headers = {
+    return {
         key: value
         for key, value in upstream_headers.items()
         if key.lower() in allowed
     }
-    if skip <= 0:
-        return headers
-
-    content_range = headers.get('Content-Range') or headers.get('content-range')
-    if content_range:
-        matched = re.match(r'bytes (\d+)-(\d+)/(\d+|\*)', content_range)
-        if matched:
-            end, total = matched.group(2), matched.group(3)
-            new_start = int(matched.group(1)) + skip
-            headers['Content-Range'] = f'bytes {new_start}-{end}/{total}'
-
-    content_length = headers.get('Content-Length') or headers.get('content-length')
-    if content_length:
-        headers['Content-Length'] = str(max(0, int(content_length) - skip))
-
-    return headers
 
 
-def iter_upstream_body(upstream: requests.Response, skip: int) -> Iterator[bytes]:
-    skipped = 0
-    for chunk in upstream.iter_content(chunk_size=64 * 1024):
-        if not chunk:
-            continue
-        if skipped < skip:
-            if skipped + len(chunk) <= skip:
-                skipped += len(chunk)
-                continue
-            chunk = chunk[skip - skipped:]
-            skipped = skip
-        yield chunk
+def iter_upstream_body(upstream: requests.Response) -> Iterator[bytes]:
+    yield from upstream.iter_content(chunk_size=64 * 1024)
 
 
 def open_audio_upstream(
     video_id: str,
     range_header: str | None = None,
-) -> tuple[requests.Response, str, int]:
-    """Open googlevideo stream; retry once with fresh URL on 403/410."""
+) -> requests.Response:
+    """Proxy a fully proxyable googlevideo URL; retry once on 403/410."""
     target = resolve_stream_target(video_id)
-    url = target['url']
-    headers, skip = _upstream_headers(target['headers'], range_header)
+    if not _url_is_fully_proxyable(target['url'], target['headers']):
+        raise StreamResolveError('unavailable', 'Direct stream URL is truncated', 502)
 
-    upstream = requests.get(url, headers=headers, stream=True, timeout=30)
+    headers = _upstream_headers(target['headers'], range_header)
+    upstream = requests.get(target['url'], headers=headers, stream=True, timeout=30)
 
     if upstream.status_code in (403, 410):
         upstream.close()
@@ -255,13 +319,14 @@ def open_audio_upstream(
         try:
             target = resolve_stream_target(video_id, bypass_cache=True)
         except StreamResolveError:
-            raise StreamResolveError('expired', 'Stream URL expired and refresh failed', 410)
-        url = target['url']
-        headers, skip = _upstream_headers(target['headers'], range_header)
-        upstream = requests.get(url, headers=headers, stream=True, timeout=30)
+            raise StreamResolveError('expired', 'Stream URL expired and refresh failed', 410) from None
+        if not _url_is_fully_proxyable(target['url'], target['headers']):
+            raise StreamResolveError('expired', 'Stream URL expired', 410)
+        headers = _upstream_headers(target['headers'], range_header)
+        upstream = requests.get(target['url'], headers=headers, stream=True, timeout=30)
         if upstream.status_code in (403, 410):
             upstream.close()
             invalidate_audio_url(video_id)
             raise StreamResolveError('expired', 'Stream URL expired', 410)
 
-    return upstream, url, skip
+    return upstream
