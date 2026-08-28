@@ -46,9 +46,10 @@ def _pick_audio_url(info: dict[str, Any]) -> str | None:
         itag = str(fmt.get('format_id') or '')
         ext = (fmt.get('ext') or '').lower()
         abr = fmt.get('abr') or 0
-        # prefer m4a / itag 140, then higher bitrate
+        # prefer m4a / itag 140, then higher bitrate; avoid DASH fragments (403 without Range)
         prefer = 2 if itag == '140' or ext == 'm4a' else (1 if ext in ('webm', 'opus') else 0)
-        return (prefer, abr)
+        dash_penalty = 1 if fmt.get('fragments') or 'dash' in (fmt.get('format') or '').lower() else 0
+        return (prefer, -dash_penalty, abr)
 
     audio_only.sort(key=score, reverse=True)
     return audio_only[0].get('url')
@@ -83,14 +84,19 @@ def invalidate_audio_url(video_id: str) -> None:
     _url_cache.invalidate(video_id)
 
 
+def _googlevideo_headers(range_header: str | None) -> dict[str, str]:
+    """googlevideo often 403/410 on DASH init URLs unless Range is present."""
+    if range_header:
+        return {'Range': range_header}
+    return {'Range': 'bytes=0-'}
+
+
 def open_audio_upstream(
     video_id: str,
     range_header: str | None = None,
 ) -> tuple[requests.Response, str]:
     """Open googlevideo stream; retry once with fresh URL on 403/410."""
-    headers: dict[str, str] = {}
-    if range_header:
-        headers['Range'] = range_header
+    headers = _googlevideo_headers(range_header)
 
     url = resolve_audio_url(video_id)
     upstream = requests.get(url, headers=headers, stream=True, timeout=30)
