@@ -3,6 +3,6 @@ flask-cors==6.0.5
 gunicorn==23.0.0
 python-dotenv==1.2.2
 requests==2.34.2
-yt-dlp[default]==2026.6.9
+yt-dlp[default,curl-cffi]==2026.8.19
 deno>=2.6.6
 ytmusicapi==1.12.1

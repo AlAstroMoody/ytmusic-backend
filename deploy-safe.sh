@@ -84,6 +84,9 @@ source venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
+echo "==> Clear yt-dlp extractor cache (fixes stale-signature 403)"
+venv/bin/yt-dlp --rm-cache-dir >/dev/null 2>&1 || true
+
 echo "==> Restart service"
 sudo systemctl daemon-reload
 sudo systemctl restart "${SERVICE_NAME}"

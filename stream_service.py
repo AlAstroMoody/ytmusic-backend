@@ -14,6 +14,12 @@ STREAM_FILE_MIN_BYTES = int(os.getenv('STREAM_FILE_MIN_BYTES', str(16 * 1024)))
 
 _AUDIO_EXTENSIONS = ('m4a', 'webm', 'opus', 'mp4', 'ogg')
 
+# Fallback when YouTube SABR/403 breaks default clients (Aug 2026).
+_FALLBACK_PLAYER_CLIENTS = (
+    ['web_embedded', 'android'],
+    ['android', 'web_embedded'],
+)
+
 _download_locks: dict[str, threading.Lock] = {}
 _download_locks_guard = threading.Lock()
 
@@ -34,11 +40,12 @@ def _classify_ytdlp_error(exc: Exception) -> StreamResolveError:
         return StreamResolveError('unavailable', str(exc), 404)
     if 'geo' in text or 'country' in text or 'not made this video available' in text:
         return StreamResolveError('geo', str(exc), 451)
+    if '403' in text or 'forbidden' in text:
+        return StreamResolveError('upstream', str(exc), 502)
     return StreamResolveError('upstream', str(exc), 502)
 
 
 def _js_runtime_opts() -> dict[str, Any]:
-    """yt-dlp needs an external JS runtime for full YouTube support (same for pip and CLI)."""
     runtimes: dict[str, dict[str, str]] = {}
 
     try:
@@ -60,17 +67,25 @@ def _js_runtime_opts() -> dict[str, Any]:
     return {'js_runtimes': runtimes}
 
 
-def _ydl_opts(*, outtmpl: str | None = None) -> dict[str, Any]:
+def _ydl_opts(
+    *,
+    outtmpl: str | None = None,
+    player_clients: list[str] | None = None,
+    rm_cachedir: bool = False,
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         'format': 'bestaudio/best',
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
-        'extractor_args': {
-            'youtube': {'player_client': ['default', '-android_sdkless']},
-        },
+        'retries': 3,
+        'fragment_retries': 3,
         **_js_runtime_opts(),
     }
+    if player_clients:
+        opts['extractor_args'] = {'youtube': {'player_client': player_clients}}
+    if rm_cachedir:
+        opts['rm_cachedir'] = True
     if outtmpl is not None:
         opts['outtmpl'] = outtmpl
     return opts
@@ -135,8 +150,44 @@ def _enforce_file_cache_limits() -> None:
         path.unlink(missing_ok=True)
 
 
+def _download_to_cache(
+    video_id: str,
+    *,
+    player_clients: list[str] | None = None,
+    rm_cachedir: bool = False,
+) -> Path:
+    _cleanup_partial_downloads(video_id)
+    STREAM_FILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    outtmpl = str(STREAM_FILE_CACHE_DIR / video_id) + '.%(ext)s'
+    watch_url = _watch_url(video_id)
+
+    with yt_dlp.YoutubeDL(_ydl_opts(
+        outtmpl=outtmpl,
+        player_clients=player_clients,
+        rm_cachedir=rm_cachedir,
+    )) as ydl:
+        info = ydl.extract_info(watch_url, download=False)
+        expected = _format_filesize(info or {})
+        # One extract + process_info — avoids stale URLs from extract-then-download.
+        ydl.process_info(info)
+
+    path = _find_cached_file(video_id)
+    if not path:
+        raise StreamResolveError('unavailable', 'Download produced no audio file', 502)
+
+    if expected and path.stat().st_size < expected * 0.9:
+        path.unlink(missing_ok=True)
+        raise StreamResolveError(
+            'truncated',
+            f'Downloaded file too small ({path.stat().st_size} < {expected})',
+            502,
+        )
+
+    return path
+
+
 def resolve_stream_file(video_id: str) -> Path:
-    """Download audio with yt-dlp (handles DASH/HLS internally) and cache on disk."""
+    """Download audio with yt-dlp (DASH/HLS merged internally) and cache on disk."""
     cached = _find_cached_file(video_id)
     if cached:
         return cached
@@ -146,38 +197,32 @@ def resolve_stream_file(video_id: str) -> Path:
         if cached:
             return cached
 
+        attempts: list[tuple[list[str] | None, bool]] = [
+            (None, False),
+            (None, True),
+        ]
+        for clients in _FALLBACK_PLAYER_CLIENTS:
+            attempts.append((clients, True))
+
+        last_error: Exception | None = None
+        for player_clients, rm_cachedir in attempts:
+            try:
+                path = _download_to_cache(
+                    video_id,
+                    player_clients=player_clients,
+                    rm_cachedir=rm_cachedir,
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            _enforce_file_cache_limits()
+            return path
+
         _cleanup_partial_downloads(video_id)
-        STREAM_FILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        outtmpl = str(STREAM_FILE_CACHE_DIR / video_id) + '.%(ext)s'
-        watch_url = _watch_url(video_id)
-
-        try:
-            with yt_dlp.YoutubeDL(_ydl_opts(outtmpl=outtmpl)) as ydl:
-                info = ydl.extract_info(watch_url, download=False)
-                expected = _format_filesize(info or {})
-                if ydl.download([watch_url]) != 0:
-                    raise StreamResolveError('upstream', 'yt-dlp download failed', 502)
-        except StreamResolveError:
-            _cleanup_partial_downloads(video_id)
-            raise
-        except Exception as exc:
-            _cleanup_partial_downloads(video_id)
-            raise _classify_ytdlp_error(exc) from exc
-
-        path = _find_cached_file(video_id)
-        if not path:
-            raise StreamResolveError('unavailable', 'Download produced no audio file', 502)
-
-        if expected and path.stat().st_size < expected * 0.9:
-            path.unlink(missing_ok=True)
-            raise StreamResolveError(
-                'truncated',
-                f'Downloaded file too small ({path.stat().st_size} < {expected})',
-                502,
-            )
-
-        _enforce_file_cache_limits()
-        return path
+        if last_error is not None:
+            raise _classify_ytdlp_error(last_error) from last_error
+        raise StreamResolveError('unavailable', 'Download produced no audio file', 502)
 
 
 def resolve_audio_url(video_id: str) -> str:
