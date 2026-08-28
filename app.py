@@ -9,7 +9,13 @@ from ytmusicapi import YTMusic, OAuthCredentials
 from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
 
 from search_pagination import SearchPaginationError, search_songs_continue, search_songs_first_page
-from stream_service import StreamResolveError, open_audio_upstream, resolve_audio_url
+from stream_service import (
+    StreamResolveError,
+    build_proxy_headers,
+    iter_upstream_body,
+    open_audio_upstream,
+    resolve_audio_url,
+)
 from track_normalize import normalize_tracks
 
 load_dotenv()
@@ -264,7 +270,7 @@ def stream():
         return jsonify({'error': 'Missing videoId parameter', 'code': 'bad_request'}), 400
 
     try:
-        upstream, _url = open_audio_upstream(
+        upstream, _url, skip = open_audio_upstream(
             video_id,
             range_header=request.headers.get('Range'),
         )
@@ -277,15 +283,11 @@ def stream():
         response.headers['Cache-Control'] = 'no-store'
         return response, 502
 
-    response_headers = {
-        key: value
-        for key, value in upstream.headers.items()
-        if key.lower() in ('content-type', 'content-length', 'content-range', 'accept-ranges')
-    }
+    response_headers = build_proxy_headers(upstream.headers, skip)
     response_headers['Cache-Control'] = 'no-store'
 
     return Response(
-        stream_with_context(upstream.iter_content(chunk_size=64 * 1024)),
+        stream_with_context(iter_upstream_body(upstream, skip)),
         status=upstream.status_code,
         headers=response_headers,
     )
