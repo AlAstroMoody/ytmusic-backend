@@ -35,13 +35,8 @@ def fetch_liked_playlist(yt: YTMusic, *, limit: int) -> dict[str, Any]:
     if tracks:
         return playlist
 
-    if _is_auth_placeholder(playlist):
-        raise LikedFetchError(
-            'auth_expired',
-            'YouTube Music auth expired or invalid. Re-export browser.json on the server.',
-            401,
-        )
-
+    # get_liked_songs often returns trackCount with empty tracks and owned=false from
+    # datacenter IPs even when cookies are valid; library API still works.
     try:
         library_tracks = yt.get_library_songs(limit=limit, order='recently_added')
     except (YTMusicServerError, YTMusicUserError) as exc:
@@ -50,6 +45,13 @@ def fetch_liked_playlist(yt: YTMusic, *, limit: int) -> dict[str, Any]:
     if library_tracks:
         playlist['tracks'] = library_tracks
         return playlist
+
+    if _is_auth_placeholder(playlist):
+        raise LikedFetchError(
+            'auth_expired',
+            'YouTube Music auth expired or invalid. Re-export browser.json on the server.',
+            401,
+        )
 
     track_count = playlist.get('trackCount') or 0
     if track_count > 0:
