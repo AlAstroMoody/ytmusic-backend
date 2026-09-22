@@ -8,6 +8,7 @@ from flask_cors import CORS
 from ytmusicapi import YTMusic, OAuthCredentials
 from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
 
+from liked_service import LikedFetchError, fetch_liked_playlist
 from search_pagination import SearchPaginationError, search_songs_continue, search_songs_first_page
 from stream_service import StreamResolveError, guess_audio_mimetype, resolve_audio_url, resolve_stream_file
 from track_normalize import normalize_tracks
@@ -187,11 +188,22 @@ def get_liked():
     auth_error = require_auth()
     if auth_error:
         return auth_error
+
+    limit_raw = request.args.get('limit', '200')
     try:
-        liked_songs = yt_auth.get_liked_songs()
-        return jsonify(liked_songs)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        limit = max(1, min(int(limit_raw), 500))
+    except ValueError:
+        return jsonify({'error': 'Invalid limit parameter'}), 400
+
+    try:
+        liked_songs = fetch_liked_playlist(yt_auth, limit=limit)
+    except LikedFetchError as exc:
+        return jsonify({'error': exc.message, 'code': exc.code}), exc.status_code
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+    liked_songs['tracks'] = normalize_tracks(liked_songs.get('tracks') or [])
+    return jsonify(liked_songs)
 
 
 @app.route('/playlists')
