@@ -5,4 +5,4 @@ python-dotenv==1.2.2
 requests==2.34.2
 yt-dlp[default,curl-cffi]==2026.8.19
 deno>=2.6.6
-ytmusicapi==1.12.1
+ytmusicapi==1.12.3

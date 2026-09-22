@@ -76,13 +76,15 @@ def search():
     except (YTMusicServerError, YTMusicUserError, requests.RequestException) as exc:
         return jsonify({'error': str(exc)}), 502
 
+    tracks = normalize_tracks(songs)
+
     if paginated:
         return jsonify({
-            'tracks': songs,
+            'tracks': tracks,
             'continuation': continuation,
         })
 
-    response = jsonify(songs)
+    response = jsonify(tracks)
     if continuation:
         response.headers['X-Search-Continuation'] = continuation
     return response
@@ -107,7 +109,7 @@ def search_continue():
         return jsonify({'error': str(exc)}), 502
 
     return jsonify({
-        'tracks': songs,
+        'tracks': normalize_tracks(songs),
         'continuation': next_continuation,
     })
 

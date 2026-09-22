@@ -39,16 +39,41 @@ def decode_continuation(token: str) -> tuple[str, int]:
         raise SearchPaginationError('Invalid or malformed continuation token') from exc
 
 
+def _run_search(yt: YTMusic, query: str, *, limit: int) -> list[dict[str, Any]]:
+    try:
+        return yt.search(query, filter='songs', limit=limit)
+    except (YTMusicServerError, YTMusicUserError) as exc:
+        raise SearchPaginationError(str(exc), 502) from exc
+
+
+def _fallback_search(yt: YTMusic, query: str, *, limit: int) -> list[dict[str, Any]]:
+    """When filtered song search breaks after YT layout changes, mix default results."""
+    try:
+        results = yt.search(query, limit=min(limit, 20))
+    except (YTMusicServerError, YTMusicUserError) as exc:
+        raise SearchPaginationError(str(exc), 502) from exc
+
+    playable: list[dict[str, Any]] = []
+    for item in results:
+        if item.get('resultType') not in ('song', 'video'):
+            continue
+        if item.get('videoId'):
+            playable.append(item)
+    return playable
+
+
+def _collect_songs(yt: YTMusic, query: str, *, limit: int) -> list[dict[str, Any]]:
+    songs = filter_songs(_run_search(yt, query, limit=limit))
+    if songs:
+        return songs
+    return _fallback_search(yt, query, limit=limit)
+
+
 def _search_page(yt: YTMusic, query: str, page: int) -> tuple[list[dict[str, Any]], str | None]:
     # ytmusicapi.search(limit=N) сам ходит за continuation внутри библиотеки.
     # Берём на 1 трек больше, чтобы понять, есть ли следующая страница.
     limit = (page + 1) * PAGE_SIZE + 1
-    try:
-        results = yt.search(query, filter='songs', limit=limit)
-    except (YTMusicServerError, YTMusicUserError) as exc:
-        raise SearchPaginationError(str(exc), 502) from exc
-
-    songs = filter_songs(results)
+    songs = _collect_songs(yt, query, limit=limit)
     start = page * PAGE_SIZE
     end = start + PAGE_SIZE
     page_songs = songs[start:end]
