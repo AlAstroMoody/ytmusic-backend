@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -18,17 +19,28 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, expose_headers=['X-Search-Continuation'])
 
-AUTH_FILE = os.getenv('AUTH_FILE') or os.getenv('OAUTH_FILE', 'browser.json')
+APP_DIR = Path(__file__).resolve().parent
+
+
+def auth_file_path() -> Path:
+    raw = os.getenv('AUTH_FILE') or os.getenv('OAUTH_FILE', 'browser.json')
+    path = Path(raw)
+    if not path.is_absolute():
+        path = APP_DIR / path
+    return path
 
 
 def load_auth_client() -> YTMusic | None:
-    if not os.path.exists(AUTH_FILE):
+    auth_path = auth_file_path()
+    if not auth_path.is_file():
+        print(f'INFO: auth file not found at {auth_path} — /liked and /playlists need browser.json')
         return None
 
     try:
-        with open(AUTH_FILE, encoding='utf-8') as f:
+        with auth_path.open(encoding='utf-8') as f:
             auth_data = json.load(f)
 
+        auth_str = str(auth_path)
         if 'access_token' in auth_data:
             client_id = os.getenv('YTM_CLIENT_ID')
             client_secret = os.getenv('YTM_CLIENT_SECRET')
@@ -39,28 +51,40 @@ def load_auth_client() -> YTMusic | None:
                 )
                 return None
             return YTMusic(
-                AUTH_FILE,
+                auth_str,
                 oauth_credentials=OAuthCredentials(
                     client_id=client_id,
                     client_secret=client_secret,
                 ),
             )
 
-        return YTMusic(AUTH_FILE)
+        return YTMusic(auth_str)
     except Exception as exc:
-        print(f'WARNING: failed to load auth from {AUTH_FILE}: {exc}')
+        print(f'WARNING: failed to load auth from {auth_path}: {exc}')
         print('Auth endpoints (/liked, /playlists) disabled; public search/stream still work')
         return None
 
 
 yt_public = YTMusic()
+yt_auth: YTMusic | None = None
+
+
+def get_auth_client() -> YTMusic | None:
+    global yt_auth
+    if yt_auth is not None:
+        return yt_auth
+    yt_auth = load_auth_client()
+    return yt_auth
+
+
 yt_auth = load_auth_client()
 
 
 def yt_search_clients() -> list[YTMusic]:
     clients: list[YTMusic] = []
-    if yt_auth is not None:
-        clients.append(yt_auth)
+    auth = get_auth_client()
+    if auth is not None:
+        clients.append(auth)
     clients.append(yt_public)
     return clients
 
@@ -173,12 +197,14 @@ def radio():
 
 
 def require_auth():
-    if yt_auth is None:
+    if get_auth_client() is None:
+        path = auth_file_path()
         return jsonify({
             'error': (
-                'Auth not configured. Create browser.json via '
-                'ytmusicapi setup (browser auth) and set AUTH_FILE in .env'
+                f'Auth not configured. Run `ytmusicapi browser` locally, copy the file to '
+                f'{path} on the server (or set AUTH_FILE in .env), then retry.'
             ),
+            'authPath': str(path),
         }), 503
     return None
 
@@ -196,7 +222,7 @@ def get_liked():
         return jsonify({'error': 'Invalid limit parameter'}), 400
 
     try:
-        liked_songs = fetch_liked_playlist(yt_auth, limit=limit)
+        liked_songs = fetch_liked_playlist(get_auth_client(), limit=limit)
     except LikedFetchError as exc:
         return jsonify({'error': exc.message, 'code': exc.code}), exc.status_code
     except Exception as exc:
@@ -212,7 +238,7 @@ def get_playlists():
     if auth_error:
         return auth_error
     try:
-        playlists = yt_auth.get_library_playlists()
+        playlists = get_auth_client().get_library_playlists()
         return jsonify(playlists)
     except Exception as e:
         return jsonify({'error': str(e)}), 500

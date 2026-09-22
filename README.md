@@ -218,17 +218,17 @@ ytmusicapi oauth --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
 source venv/bin/activate
 ```
 
-2. Запустите setup:
+2. Запустите (интерактивно, вставьте request headers из DevTools на `music.youtube.com`):
 
 ```bash
-ytmusicapi setup
+ytmusicapi browser
 ```
 
-3. Выберите вариант **browser**.
-4. Откройте `music.youtube.com` под нужным аккаунтом.
-5. В DevTools -> Network найдите любой запрос к YouTube Music и скопируйте **request headers**.
-6. Вставьте headers в интерактивный setup.  
-   В текущей папке появится `browser.json`.
+3. В текущей папке появится `browser.json`. Скопируйте на сервер:
+
+```bash
+scp browser.json user@actepukc90.fvds.ru:/opt/ytmusic-backend/browser.json
+```
 
 ## Безопасный повторный деплой (одна команда)
 
