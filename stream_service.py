@@ -67,6 +67,18 @@ def _js_runtime_opts() -> dict[str, Any]:
     return {'js_runtimes': runtimes}
 
 
+def ytdlp_lookup_opts() -> dict[str, Any]:
+    """Minimal yt-dlp options for metadata lookup (search), not download."""
+    return {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'extract_flat': 'in_playlist',
+        'noplaylist': True,
+        **_js_runtime_opts(),
+    }
+
+
 def _ydl_opts(
     *,
     outtmpl: str | None = None,

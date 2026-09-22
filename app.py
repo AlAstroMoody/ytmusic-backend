@@ -56,6 +56,14 @@ yt_public = YTMusic()
 yt_auth = load_auth_client()
 
 
+def yt_search_clients() -> list[YTMusic]:
+    clients: list[YTMusic] = []
+    if yt_auth is not None:
+        clients.append(yt_auth)
+    clients.append(yt_public)
+    return clients
+
+
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
@@ -70,7 +78,7 @@ def search():
     paginated = request.args.get('paginated', '').lower() in ('1', 'true', 'yes')
 
     try:
-        songs, continuation = search_songs_first_page(yt_public, query)
+        songs, continuation = search_songs_first_page(yt_search_clients(), query)
     except SearchPaginationError as exc:
         return jsonify({'error': str(exc)}), exc.status_code
     except (YTMusicServerError, YTMusicUserError, requests.RequestException) as exc:
@@ -102,7 +110,7 @@ def search_continue():
         return jsonify({'error': 'Missing continuation parameter'}), 400
 
     try:
-        songs, next_continuation = search_songs_continue(yt_public, continuation)
+        songs, next_continuation = search_songs_continue(yt_search_clients(), continuation)
     except SearchPaginationError as exc:
         return jsonify({'error': str(exc)}), exc.status_code
     except (YTMusicServerError, YTMusicUserError, requests.RequestException) as exc:
